@@ -80,6 +80,7 @@ table.board { width: 100%; border-collapse: collapse; }
 .board .slug { color: var(--faint); font-size: 12px; font-family: var(--num); }
 .pill { display: inline-block; border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; font-size: 11.5px; color: var(--muted); white-space: nowrap; }
 .wl { color: var(--amber); border-color: #57451a; font-weight: 700; }
+.rng { color: var(--faint); font-family: var(--num); font-size: 11px; margin-top: 1px; white-space: nowrap; }
 .bar { height: 5px; border-radius: 3px; background: var(--signal-dim); margin-top: 5px; }
 .bar i { display: block; height: 100%; border-radius: 3px; background: var(--signal); }
 .empty { padding: 34px; text-align: center; color: var(--muted); }

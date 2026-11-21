@@ -7,22 +7,31 @@
 A token launch radar: every protocol in the sealed DefiLlama snapshot that records no token,
 ranked by the value its token would carry if it traded like its category's live peers.
 
-## The model (lib/model.ts, radar-2-peer)
+## The model (lib/model.ts, radar-3-band)
 
 implied = TVL x peer multiple x growth factor x maturity factor x breadth factor
 
-- Peer multiple: per category, the median market-cap/TVL of the protocols whose token already
-  trades, shrunk toward the global median by peer count and bounded to 0.05x-3x. Recomputed from
-  the snapshot on every run; no protocol name is ever special-cased.
+- Peer evidence: per category, the market-cap/TVL ratios of the protocols whose token already
+  trades, winsorised to the global 2.5-97.5 percentile range so one wild print cannot move a
+  median. Recomputed from the snapshot on every run; no protocol name is ever special-cased.
+- Peer multiple: a protocol is priced off the traded peers nearest its own size — when at least
+  3 category peers sit within 0.1x-10x of its TVL, their median, shrunk toward the category
+  multiple (weight n/(n+4)), is used; otherwise the category median, shrunk toward the global
+  median the same way. All multiples are bounded to 0.05x-3x.
+- Peer band: every value also carries a low-high range from the middle half (interquartile
+  range) of the peer multiples it was priced from, shrunk the same way, so the spread of the
+  evidence is printed next to the point estimate in board.json, the board and the detail view.
 - Growth: 1 + clamp(change_7d, -50, +100)/100 x 0.6 (unreported change is neutral).
 - Maturity: 0.55 + 0.45 x ln(1 + age)/ln(1 + 1460); an unreported listing date is modelled as
-  270 days and flagged in the row.
+  the median age of the protocol's own category (else of the whole snapshot, else 270 days)
+  and flagged in the row.
 - Breadth: 1 + 0.03 per extra chain, up to +18%.
 
 The board covers the whole 40-protocol watchlist plus the largest rankable pre-token protocols
-below the $50M floor. Every row carries its full factor breakdown and a 7-step farm plan with
-costs and times; the dashboard (board, detail drawer per protocol, filters, live-token tab kept
-apart from the ranking) renders exactly the board's data.
+below the $50M floor. Every row carries its full factor breakdown, its peer band and a 7-step
+farm plan with costs and times (the plan's own seven-day TVL move included); the dashboard
+(board with implied ranges, detail drawer per protocol, filters, live-token tab kept apart
+from the ranking) renders exactly the board's data.
 
 ## Run
 

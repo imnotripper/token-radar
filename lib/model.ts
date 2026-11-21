@@ -1,22 +1,31 @@
-// Token Radar model v2: peer-priced implied value, built only from the snapshot's own figures.
+// Token Radar model v3: peer-priced implied value with a peer band, built only from the
+// snapshot's own figures.
 //
 // The starter model priced every protocol at one flat multiple of TVL (0.25x). This model instead
 // asks what the snapshot itself says a dollar of TVL is worth in each category: for every category
 // it takes the live-token protocols (the ones whose token already trades), forms each one's
-// market-cap / TVL ratio, and uses the category median, shrunk toward the global median when a
-// category has few traded peers. A pre-token protocol is then priced as if its token traded like
-// its category's peers, adjusted by three factors the snapshot also carries:
+// market-cap / TVL ratio, winsorises the ratios to the global 2.5-97.5 percentile range so one
+// wild print cannot move a median, and uses the category median, shrunk toward the global median
+// when a category has few traded peers. A protocol is priced off the peers nearest its own size
+// when enough of them trade: the category peers whose TVL sits within a tenth to ten times its
+// own form a size band, and with at least three of them their median, shrunk toward the category
+// multiple, is the multiple used. Every value also carries the middle half of its peer multiples
+// (the interquartile range, shrunk the same way) as a low-high band, so a reader sees the spread
+// of the evidence and not only the point. A pre-token protocol is then priced as if its token
+// traded like those peers, adjusted by three factors the snapshot also carries:
 //
-//   implied = TVL x peer_multiple(category) x growth_factor x maturity_factor x breadth_factor
+//   implied = TVL x peer_multiple x growth_factor x maturity_factor x breadth_factor
 //
 //   growth_factor    1 + clamp(change_7d, -50, +100) / 100 x 0.6   (unreported change: neutral 1)
 //   maturity_factor  0.55 + 0.45 x ln(1 + age_days) / ln(1 + 1460) (age capped at four years;
-//                    an unreported listing date is modelled as 270 days and flagged in the row)
+//                    an unreported listing date is modelled as the median age of the protocol's
+//                    category, else of the whole snapshot, else 270 days, and flagged in the row)
 //   breadth_factor   1 + 0.03 x min(chains - 1, 6)                  (each extra chain, up to +18%)
 //
-// No protocol name is ever special-cased: the same function prices every row, the peer multiples
-// are recomputed from whatever snapshot is handed in, and every factor of every row is written to
-// board.json and shown in the dashboard's detail view, so a reader can recompute any row by hand.
+// No protocol name is ever special-cased: the same function prices every row, the peer evidence
+// is recomputed from whatever snapshot is handed in, and every factor of every row, band
+// included, is written to board.json and shown in the dashboard's detail view, so a reader can
+// recompute any row by hand.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -55,6 +64,11 @@ export interface ModelConstants {
   peer_shrink_k: number;
   peer_min: number;
   peer_max: number;
+  winsor_lo_q: number;
+  winsor_hi_q: number;
+  band_min_peers: number;
+  band_lo_ratio: number;
+  band_hi_ratio: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -70,9 +84,14 @@ export const MODEL: ModelConstants = {
   peer_shrink_k: 4,
   peer_min: 0.05,
   peer_max: 3,
+  winsor_lo_q: 0.025,
+  winsor_hi_q: 0.975,
+  band_min_peers: 3,
+  band_lo_ratio: 0.1,
+  band_hi_ratio: 10,
 };
 
-export const MODEL_VERSION = 'radar-2-peer';
+export const MODEL_VERSION = 'radar-3-band';
 
 /** How many pre-token protocols below the watchlist floor the early radar adds, by TVL. */
 export const EARLY_ROWS = 220;
@@ -80,12 +99,22 @@ export const EARLY_ROWS = 220;
 /** How many live-token protocols the dashboard's Live view carries, by market cap. */
 export const LIVE_ROWS = 24;
 
-/** One category's peer evidence: how many traded peers, and the multiple they imply. */
+/** One category's peer evidence: how many traded peers, the multiple they imply, and its spread. */
 export interface CategoryPeer {
   category: string;
   peers: number;
   median_multiple: number;
   used_multiple: number;
+  band_low: number;
+  band_high: number;
+}
+
+/** A farm plan's shape at a glance: what it costs to open, to run, and how long it holds. */
+export interface FarmSummary {
+  capital_usd: number;
+  setup_gas_usd: number;
+  weekly_gas_usd: number;
+  hold_days: number;
 }
 
 /** One row of board.json: the ranked board's row, with the whole model breakdown attached. */
@@ -105,9 +134,14 @@ export interface BoardRow {
   watchlist: boolean;
   age_days: number | null;
   implied_value_usd: number;
+  implied_low_usd: number;
+  implied_high_usd: number;
   model: {
     peer_multiple: number;
     peer_count: number;
+    band_count: number;
+    peer_band_low: number;
+    peer_band_high: number;
     growth_pct: number | null;
     growth_multiplier: number;
     maturity_multiplier: number;
@@ -115,6 +149,7 @@ export interface BoardRow {
     age_days: number | null;
     age_modelled: boolean;
   };
+  farm: FarmSummary;
   farm_steps: string[];
 }
 
@@ -141,6 +176,8 @@ export interface RadarData {
   model: ModelConstants;
   model_version: string;
   global_multiple: number;
+  global_band_low: number;
+  global_band_high: number;
   categories: CategoryPeer[];
   scanned_size: number;
   watchlist_size: number;
@@ -179,64 +216,193 @@ function median(values: number[]): number {
   return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
+/** The q-quantile of a list of numbers, by linear interpolation over its sorted order. */
+function quantile(values: number[], q: number): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  if (sorted.length === 1) return sorted[0]!;
+  const pos = q * (sorted.length - 1);
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (pos - lo);
+}
+
+/** One traded protocol's peer evidence: its winsorised market-cap / TVL ratio and its TVL. */
+export interface PeerEntry {
+  ratio: number;
+  tvl: number;
+}
+
 /**
- * The peer multiples: one per category, from the snapshot's traded protocols. A category's raw
- * median is shrunk toward the global median by its peer count (weight n / (n + K)), then bounded,
- * so a category with two traded names cannot price a pre-token protocol at an outlier's ratio.
+ * The peer evidence of a whole snapshot: every traded protocol's ratio, winsorised to the global
+ * winsor quantiles so one wild print cannot move a median, kept per category with its TVL so a
+ * protocol can be priced off the peers nearest its own size; and each category's median and
+ * interquartile band, shrunk toward the global figures by peer count (weight n / (n + K)) and
+ * bounded, so a category with two traded names cannot price a pre-token protocol at an outlier.
  */
-export function peerMultiples(snapshot: Snapshot, model: ModelConstants = MODEL): { global: number; byCategory: Map<string, CategoryPeer> } {
-  const ratiosByCategory = new Map<string, number[]>();
-  const all: number[] = [];
+export interface PeerBook {
+  global_multiple: number;
+  global_low: number;
+  global_high: number;
+  byCategory: Map<string, CategoryPeer>;
+  entries: Map<string, PeerEntry[]>;
+  allRatios: number[];
+}
+
+/** A quartile shrunk toward the global quartile by count and bounded to the model's range. */
+function shrunkQuartile(values: number[], q: number, globalQ: number, model: ModelConstants): number {
+  const raw = quantile(values, q);
+  const shrunk = (values.length * raw + model.peer_shrink_k * globalQ) / (values.length + model.peer_shrink_k);
+  return round4(clamp(shrunk, model.peer_min, model.peer_max));
+}
+
+/** The snapshot's peer evidence, recomputed from its own figures on every call. */
+export function peerMultiples(snapshot: Snapshot, model: ModelConstants = MODEL): PeerBook {
+  const rawByCategory = new Map<string, PeerEntry[]>();
+  const rawAll: number[] = [];
   for (const p of snapshot.protocols) {
     if (p.mcap_usd === null || p.tvl_usd <= 0) continue;
     const ratio = p.mcap_usd / p.tvl_usd;
     if (!Number.isFinite(ratio) || ratio <= 0) continue;
-    all.push(ratio);
+    rawAll.push(ratio);
     const key = p.category ?? 'Uncategorised';
-    const list = ratiosByCategory.get(key);
-    if (list === undefined) ratiosByCategory.set(key, [ratio]);
-    else list.push(ratio);
+    const list = rawByCategory.get(key);
+    if (list === undefined) rawByCategory.set(key, [{ ratio, tvl: p.tvl_usd }]);
+    else list.push({ ratio, tvl: p.tvl_usd });
   }
-  const global = all.length > 0 ? clamp(median(all), model.peer_min, model.peer_max) : model.peer_min;
+  const wLo = rawAll.length >= 8 ? quantile(rawAll, model.winsor_lo_q) : rawAll.length > 0 ? Math.min(...rawAll) : 0;
+  const wHi = rawAll.length >= 8 ? quantile(rawAll, model.winsor_hi_q) : rawAll.length > 0 ? Math.max(...rawAll) : 0;
+  const entries = new Map<string, PeerEntry[]>();
+  const allRatios: number[] = [];
+  for (const [category, list] of rawByCategory) {
+    const winsorised = list.map((e) => ({ ratio: clamp(e.ratio, wLo, wHi), tvl: e.tvl }));
+    entries.set(category, winsorised);
+    for (const e of winsorised) allRatios.push(e.ratio);
+  }
+  const globalMedian = allRatios.length > 0 ? clamp(median(allRatios), model.peer_min, model.peer_max) : model.peer_min;
+  const globalLow = allRatios.length > 0 ? round4(clamp(quantile(allRatios, 0.25), model.peer_min, model.peer_max)) : model.peer_min;
+  const globalHigh = allRatios.length > 0 ? round4(clamp(quantile(allRatios, 0.75), model.peer_min, model.peer_max)) : model.peer_min;
   const byCategory = new Map<string, CategoryPeer>();
-  for (const [category, ratios] of ratiosByCategory) {
+  for (const [category, list] of entries) {
+    const ratios = list.map((e) => e.ratio);
     const med = median(ratios);
-    const shrunk = (ratios.length * med + model.peer_shrink_k * global) / (ratios.length + model.peer_shrink_k);
+    const shrunk = (ratios.length * med + model.peer_shrink_k * globalMedian) / (ratios.length + model.peer_shrink_k);
     byCategory.set(category, {
       category,
       peers: ratios.length,
       median_multiple: round4(med),
       used_multiple: round4(clamp(shrunk, model.peer_min, model.peer_max)),
+      band_low: shrunkQuartile(ratios, 0.25, globalLow, model),
+      band_high: shrunkQuartile(ratios, 0.75, globalHigh, model),
     });
   }
-  return { global: round4(global), byCategory };
+  return { global_multiple: round4(globalMedian), global_low: globalLow, global_high: globalHigh, byCategory, entries, allRatios };
 }
 
-/** The multiple a protocol is priced at: its category's peer multiple, else the global one. */
-function peerFor(p: SnapshotProtocol, peers: { global: number; byCategory: Map<string, CategoryPeer> }): { multiple: number; count: number } {
-  const entry = peers.byCategory.get(p.category ?? 'Uncategorised');
-  if (entry === undefined) return { multiple: peers.global, count: 0 };
-  return { multiple: entry.used_multiple, count: entry.peers };
+/** The median ages the snapshot itself reports: per category, and one global figure. */
+export interface AgeBook {
+  byCategory: Map<string, number>;
+  global: number | null;
 }
 
-/** Every factor of one protocol's implied value, and the value itself. */
+/** Every protocol's reported age, grouped: the fallback an unreported listing date inherits. */
+export function ageMedians(snapshot: Snapshot): AgeBook {
+  const byCategory = new Map<string, number[]>();
+  const all: number[] = [];
+  for (const p of snapshot.protocols) {
+    const age = ageDays(snapshot.as_of, p.listed_at);
+    if (age === null) continue;
+    all.push(age);
+    const key = p.category ?? 'Uncategorised';
+    const list = byCategory.get(key);
+    if (list === undefined) byCategory.set(key, [age]);
+    else list.push(age);
+  }
+  const medians = new Map<string, number>();
+  for (const [category, ages] of byCategory) medians.set(category, Math.round(median(ages)));
+  return { byCategory: medians, global: all.length > 0 ? Math.round(median(all)) : null };
+}
+
+/**
+ * The multiple a protocol is priced at, and the band around it. With at least band_min_peers
+ * traded category peers within the size band (a tenth to ten times the protocol's own TVL), the
+ * band's median, shrunk toward the category multiple, prices it and the band's middle half,
+ * shrunk toward the category's, bounds it; otherwise the category's own median and band serve,
+ * and a category with no traded peers falls back to the global figures.
+ */
+function peerFor(
+  p: SnapshotProtocol,
+  book: PeerBook,
+  model: ModelConstants,
+): { multiple: number; count: number; bandCount: number; low: number; high: number } {
+  const key = p.category ?? 'Uncategorised';
+  const cat = book.byCategory.get(key);
+  const entries = book.entries.get(key) ?? [];
+  if (cat === undefined) {
+    return { multiple: book.global_multiple, count: 0, bandCount: 0, low: book.global_low, high: book.global_high };
+  }
+  const band = entries.filter((e) => e.tvl >= p.tvl_usd * model.band_lo_ratio && e.tvl <= p.tvl_usd * model.band_hi_ratio);
+  if (band.length >= model.band_min_peers) {
+    const ratios = band.map((e) => e.ratio);
+    const med = median(ratios);
+    const multiple = round4(clamp((band.length * med + model.peer_shrink_k * cat.used_multiple) / (band.length + model.peer_shrink_k), model.peer_min, model.peer_max));
+    let low = shrunkQuartile(ratios, 0.25, cat.band_low, model);
+    let high = shrunkQuartile(ratios, 0.75, cat.band_high, model);
+    low = Math.min(low, multiple);
+    high = Math.max(high, multiple);
+    return { multiple, count: cat.peers, bandCount: band.length, low, high };
+  }
+  return { multiple: cat.used_multiple, count: cat.peers, bandCount: 0, low: Math.min(cat.band_low, cat.used_multiple), high: Math.max(cat.band_high, cat.used_multiple) };
+}
+
+/** Every factor of one protocol's implied value, its peer band, and the value itself. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
-  peers: { global: number; byCategory: Map<string, CategoryPeer> },
+  book: PeerBook,
+  ages: AgeBook,
   model: ModelConstants = MODEL,
-): { implied: number; peerMultiple: number; peerCount: number; growthPct: number | null; growthMult: number; maturityMult: number; breadthMult: number; age: number | null; ageModelled: boolean } {
+): {
+  implied: number;
+  impliedLow: number;
+  impliedHigh: number;
+  peerMultiple: number;
+  peerCount: number;
+  bandCount: number;
+  bandLow: number;
+  bandHigh: number;
+  growthPct: number | null;
+  growthMult: number;
+  maturityMult: number;
+  breadthMult: number;
+  age: number | null;
+  ageModelled: boolean;
+} {
   const age = ageDays(asOf, protocol.listed_at);
   const ageModelled = age === null;
-  const ageForModel = age ?? model.unknown_age_days;
+  const ageForModel = age ?? ages.byCategory.get(protocol.category ?? 'Uncategorised') ?? ages.global ?? model.unknown_age_days;
   const growthPct = protocol.change_7d === null ? null : clamp(protocol.change_7d, model.growth_floor, model.growth_cap);
   const growthMult = 1 + ((growthPct ?? 0) / 100) * model.growth_weight;
   const maturityMult =
     model.maturity_base + model.maturity_span * (Math.log1p(Math.min(ageForModel, model.maturity_days)) / Math.log1p(model.maturity_days));
   const breadthMult = 1 + model.breadth_per_chain * Math.min(Math.max(protocol.chains.length - 1, 0), model.breadth_max_extra);
-  const { multiple, count } = peerFor(protocol, peers);
-  const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult * breadthMult));
-  return { implied, peerMultiple: multiple, peerCount: count, growthPct, growthMult, maturityMult, breadthMult, age, ageModelled };
+  const peer = peerFor(protocol, book, model);
+  const price = (multiple: number): number => Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult * breadthMult));
+  return {
+    implied: price(peer.multiple),
+    impliedLow: price(peer.low),
+    impliedHigh: price(peer.high),
+    peerMultiple: peer.multiple,
+    peerCount: peer.count,
+    bandCount: peer.bandCount,
+    bandLow: peer.low,
+    bandHigh: peer.high,
+    growthPct,
+    growthMult,
+    maturityMult,
+    breadthMult,
+    age,
+    ageModelled,
+  };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -271,7 +437,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   for (const p of early) chosen.set(p.slug, p);
 
   const peers = peerMultiples(snapshot, model);
-  const scored = [...chosen.values()].map((p) => ({ p, v: impliedValue(p, snapshot.as_of, peers, model) }));
+  const ages = ageMedians(snapshot);
+  const scored = [...chosen.values()].map((p) => ({ p, v: impliedValue(p, snapshot.as_of, peers, ages, model) }));
   scored.sort((a, b) => b.v.implied - a.v.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
     rank: i + 1,
@@ -289,9 +456,14 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     watchlist: watch.has(s.p.slug),
     age_days: s.v.age,
     implied_value_usd: s.v.implied,
+    implied_low_usd: s.v.impliedLow,
+    implied_high_usd: s.v.impliedHigh,
     model: {
       peer_multiple: s.v.peerMultiple,
       peer_count: s.v.peerCount,
+      band_count: s.v.bandCount,
+      peer_band_low: s.v.bandLow,
+      peer_band_high: s.v.bandHigh,
       growth_pct: s.v.growthPct,
       growth_multiplier: round4(s.v.growthMult),
       maturity_multiplier: round4(s.v.maturityMult),
@@ -299,6 +471,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       age_days: s.v.age,
       age_modelled: s.v.ageModelled,
     },
+    farm: farmSummary(s.p, s.v.age),
     farm_steps: farmSteps(s.p, s.v.age),
   }));
 }
@@ -359,16 +532,35 @@ function engageFor(p: SnapshotProtocol, chain: string): string {
   return `Use one more feature of ${n} on ${chain} each week (a second pool, a borrow, a vote or a swap) so the wallet is a user, not a deposit`;
 }
 
+/** A plan's shape at a glance, from the same helpers that write its steps, so they cannot drift. */
+export function farmSummary(p: SnapshotProtocol, age: number | null): FarmSummary {
+  const capital = capitalFor(p);
+  return {
+    capital_usd: capital,
+    setup_gas_usd: capital >= 150 ? 8 : capital >= 100 ? 6 : 4,
+    weekly_gas_usd: 2,
+    hold_days: holdDaysFor(age),
+  };
+}
+
 /**
  * A protocol's farm plan: seven steps, each an action with a cost and a time, derived from the
- * protocol's own record (category, chains, TVL tier, age) — never from a hand-written name list.
- * The same strings go to board.json and to the dashboard's detail view, so the two cannot disagree.
+ * protocol's own record (category, chains, TVL tier, age, and its seven-day TVL move) — never
+ * from a hand-written name list. The same strings go to board.json and to the dashboard's detail
+ * view, so the two cannot disagree.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
   const chain = chainOf(p);
-  const capital = capitalFor(p);
-  const hold = holdDaysFor(age);
-  const gas = capital >= 150 ? 8 : capital >= 100 ? 6 : 4;
+  const summary = farmSummary(p, age);
+  const capital = summary.capital_usd;
+  const hold = summary.hold_days;
+  const gas = summary.setup_gas_usd;
+  const move =
+    p.change_7d === null
+      ? ''
+      : ` Its TVL ${p.change_7d >= 0 ? 'grew' : 'fell'} ${Math.abs(p.change_7d).toFixed(1)}% in the seven days to the snapshot, so ${
+          p.change_7d >= 0 ? 'expect other farmers to be arriving' : 'size in gradually rather than all at once'
+        }`;
   const steps: Array<{ text: string; cost: string; time: string }> = [
     {
       text: `Set up a fresh wallet for ${p.name} alone, fund it from an exchange (never from a wallet you farm elsewhere), and keep its seed phrase offline`,
@@ -386,7 +578,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
       time: '10 minutes a week',
     },
     {
-      text: `Hold the position for at least ${hold} days and keep the balance above half its starting size, so the wallet appears in more than one weekly snapshot`,
+      text: `Hold the position for at least ${hold} days and keep the balance above half its starting size, so the wallet appears in more than one weekly snapshot.${move}`,
       cost: `the $${capital} stays in the position for the whole window`,
       time: `${hold} days`,
     },
@@ -443,7 +635,9 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     floor_usd: snapshot.floor_usd,
     model,
     model_version: MODEL_VERSION,
-    global_multiple: peers.global,
+    global_multiple: peers.global_multiple,
+    global_band_low: peers.global_low,
+    global_band_high: peers.global_high,
     categories,
     scanned_size: snapshot.protocols.length,
     watchlist_size: snapshot.watchlist.length,

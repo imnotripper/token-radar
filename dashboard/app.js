@@ -103,19 +103,20 @@
       return el('tr', {}, [
         el('td', { text: c.category }), el('td', { class: 'num', text: String(c.peers) }),
         el('td', { class: 'num', text: c.median_multiple.toFixed(2) + 'x' }),
-        el('td', { class: 'num', text: c.used_multiple.toFixed(2) + 'x' })
+        el('td', { class: 'num', text: c.used_multiple.toFixed(2) + 'x' }),
+        el('td', { class: 'num', text: c.band_low.toFixed(2) + 'x\u2013' + c.band_high.toFixed(2) + 'x' })
       ]);
     });
-    rows.push(el('tr', {}, [el('td', { text: 'All categories (fallback)' }), el('td', {}), el('td', {}), el('td', { class: 'num', text: DATA.global_multiple.toFixed(2) + 'x' })]));
+    rows.push(el('tr', {}, [el('td', { text: 'All categories (fallback)' }), el('td', {}), el('td', {}), el('td', { class: 'num', text: DATA.global_multiple.toFixed(2) + 'x' }), el('td', { class: 'num', text: DATA.global_band_low.toFixed(2) + 'x\u2013' + DATA.global_band_high.toFixed(2) + 'x' })]));
     return el('section', { class: 'model', 'aria-label': 'The value model' }, [
       el('div', {}, [
         el('h2', { text: 'The model: peer-priced, nothing hardcoded' }),
-        el('p', { text: 'For each category, take the protocols whose token already trades, divide market cap by TVL, and use the median — shrunk toward the global median when a category has few peers, and bounded to 0.05x–3x. Then adjust for the week\u2019s TVL growth, for how long the protocol has run with no token, and for how many chains it runs on. No name is special-cased; open any row to recompute it.' }),
+        el('p', { text: 'For each category, take the protocols whose token already trades and divide market cap by TVL. The ratios are winsorised to the global middle 95% so one wild print cannot move a median, and each protocol is priced off the traded peers nearest its own size when at least three trade within a tenth to ten times its TVL. Every value carries a band: the middle half of its peer multiples, so the spread of the evidence is printed next to the point. Then adjust for the week\u2019s TVL growth, for how long the protocol has run with no token, and for how many chains it runs on. No name is special-cased; open any row to recompute it.' }),
         el('div', { class: 'formula', text: 'implied = TVL \u00d7 peer multiple \u00d7 growth factor \u00d7 maturity factor \u00d7 breadth factor' }),
         el('p', { text: 'Model ' + DATA.model_version + '. Protocols that already trade are never ranked: the Live tab shows them at the market\u2019s own values, apart.' })
       ]),
       el('table', { class: 'peers', 'aria-label': 'Peer multiples by category' }, [
-        el('thead', {}, [el('tr', {}, [el('th', { text: 'Category' }), el('th', { text: 'Traded peers' }), el('th', { text: 'Median mcap/TVL' }), el('th', { text: 'Used' })])]),
+        el('thead', {}, [el('tr', {}, [el('th', { text: 'Category' }), el('th', { text: 'Traded peers' }), el('th', { text: 'Median mcap/TVL' }), el('th', { text: 'Used' }), el('th', { text: 'Peer band' })])]),
         el('tbody', {}, rows)
       ])
     ]);
@@ -177,6 +178,7 @@
         el('td', { class: 'num', text: r.model.peer_multiple.toFixed(2) + 'x' }),
         el('td', {}, [
           el('div', { class: 'num', text: usd(r.implied_value_usd) }),
+          el('div', { class: 'rng', text: usd(r.implied_low_usd) + ' \u2013 ' + usd(r.implied_high_usd) }),
           el('div', { class: 'bar', 'aria-hidden': 'true' }, [el('i', { style: 'width:' + Math.max(2, Math.round(100 * r.implied_value_usd / max)) + '%' })])
         ])
       ]);
@@ -230,20 +232,23 @@
       el('p', { class: 'sub', text: (r.category || 'Uncategorised') + ' \u00b7 ' + (r.chains || []).join(', ') + ' \u00b7 records no token in the snapshot' }),
       el('div', { class: 'facts' }, [
         fact('Implied value', usd(r.implied_value_usd)),
+        fact('Implied range', usd(r.implied_low_usd) + ' \u2013 ' + usd(r.implied_high_usd)),
         fact('TVL', usd(r.tvl_usd)),
         fact('TVL change, 7d', pct(r.change_7d)),
-        fact('Age with no token', age(r.age_days) + (m.age_modelled ? ' (modelled)' : ''))
+        fact('Age with no token', age(r.age_days) + (m.age_modelled ? ' (category median)' : ''))
       ]),
       el('h3', { text: 'How the value is built', style: 'margin-top:18px' }),
       el('div', { class: 'wf' }, [
         wf('TVL', usd(r.tvl_usd)),
-        wf('\u00d7 peer multiple (' + m.peer_count + ' traded ' + (r.category || 'peers') + ')', m.peer_multiple.toFixed(2) + 'x'),
+        wf('\u00d7 peer multiple (' + (m.band_count > 0 ? m.band_count + ' of ' + m.peer_count + ' traded ' + (r.category || 'peers') + ' in its size band' : m.peer_count + ' traded ' + (r.category || 'peers')) + ')', m.peer_multiple.toFixed(2) + 'x'),
+        wf('Peer band (middle half of those multiples)', m.peer_band_low.toFixed(2) + 'x \u2013 ' + m.peer_band_high.toFixed(2) + 'x'),
         wf('\u00d7 growth factor', m.growth_multiplier.toFixed(2) + 'x'),
         wf('\u00d7 maturity factor', m.maturity_multiplier.toFixed(2) + 'x'),
         wf('\u00d7 breadth factor', m.breadth_multiplier.toFixed(2) + 'x'),
         wf('= implied value', usd(r.implied_value_usd))
       ]),
       el('h3', { text: 'Farm plan', style: 'margin-top:18px' }),
+      el('p', { class: 'sub', text: 'At a glance: ' + usd(r.farm.capital_usd) + ' of capital to open, about ' + usd(r.farm.setup_gas_usd) + ' of setup gas and ' + usd(r.farm.weekly_gas_usd) + ' a week to run, held at least ' + r.farm.hold_days + ' days.' }),
       el('div', { class: 'steps' }, r.farm_steps.map(function (s, i) {
         return el('div', { class: 'step' }, [el('div', { class: 'n', text: String(i + 1) }), el('p', { text: s })]);
       })),
